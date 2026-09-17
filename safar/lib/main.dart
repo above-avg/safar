@@ -65,18 +65,9 @@ class SafarMainShell extends StatefulWidget {
 class _SafarMainShellState extends State<SafarMainShell> {
   int _currentIndex = 0; // Default to Live Survey -- the primary workflow
 
-  late final List<Widget> _screens;
-
   @override
   void initState() {
     super.initState();
-    _screens = [
-      const LiveSurveyScreen(),
-      const ManualArRulerScreen(),
-      const InteractiveMapScreen(),
-      const UploadCloudScreen(),
-      const ChainageDashboardScreen(),
-    ];
   }
 
   void _navigateToSecondaryScreen(Widget screen) {
@@ -351,7 +342,13 @@ class _SafarMainShellState extends State<SafarMainShell> {
     return Scaffold(
       body: IndexedStack(
         index: _currentIndex,
-        children: _screens,
+        children: [
+          LiveSurveyScreen(isActive: _currentIndex == 0),
+          const ManualArRulerScreen(),
+          const InteractiveMapScreen(),
+          const UploadCloudScreen(),
+          const ChainageDashboardScreen(),
+        ],
       ),
       bottomNavigationBar: Container(
         decoration: const BoxDecoration(

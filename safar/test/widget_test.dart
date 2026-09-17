@@ -3,11 +3,13 @@
 // 5m Chainage Binning, GeoJSON generation, and Application Shell.
 
 import 'dart:convert';
+import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:safar/main.dart';
 import 'package:safar/models/camera_calibration.dart';
 import 'package:safar/models/transect.dart';
 import 'package:safar/models/prediction.dart';
+import 'package:safar/screens/manual_ar_ruler_screen.dart';
 import 'package:safar/services/road_pipeline_service.dart';
 
 void main() {
@@ -175,6 +177,36 @@ void main() {
       expect(find.text('MAP'), findsOneWidget);
       expect(find.text('CLOUD'), findsOneWidget);
       expect(find.text('DATA'), findsOneWidget);
+    });
+
+    testWidgets('ManualArRulerScreen renders InteractiveViewer, zoom controls, and Add Road action', (WidgetTester tester) async {
+      await tester.pumpWidget(const MaterialApp(
+        home: ManualArRulerScreen(),
+      ));
+      await tester.pumpAndSettle();
+
+      // Verify Overhead Map is displayed by default
+      expect(find.text('OVERHEAD ROAD MAP (BEV)'), findsOneWidget);
+
+      // Verify Zoom HUD buttons exist (+, -, fit_screen, zoom %)
+      expect(find.byIcon(Icons.add), findsWidgets);
+      expect(find.byIcon(Icons.remove), findsOneWidget);
+      expect(find.byIcon(Icons.fit_screen), findsOneWidget);
+      expect(find.text('100%'), findsOneWidget);
+
+      // Verify Action buttons: ADD ROAD and + JUNCTION
+      expect(find.text('ADD ROAD'), findsOneWidget);
+      expect(find.text('+ JUNCTION'), findsOneWidget);
+
+      // Tap ADD ROAD to open the road creation bottom sheet
+      await tester.tap(find.text('ADD ROAD'));
+      await tester.pumpAndSettle();
+
+      // Verify modal sheet opened with road creation parameters
+      expect(find.text('ADD NEW ROAD CORRIDOR'), findsOneWidget);
+      expect(find.text('FROM JUNCTION'), findsOneWidget);
+      expect(find.text('TO JUNCTION'), findsOneWidget);
+      expect(find.text('ADD ROAD TO NETWORK'), findsOneWidget);
     });
   });
 }

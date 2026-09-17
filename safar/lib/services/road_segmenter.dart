@@ -227,24 +227,21 @@ class ClassicalRoadSegmenter implements RoadSegmenter {
       if (vpEstimate != null) {
         vpX = vpEstimate[0];
         vpY = vpEstimate[1];
+        final double mL = vpEstimate[2];
+        final double cL = vpEstimate[3];
+        final double mR = vpEstimate[4];
+        final double cR = vpEstimate[5];
 
-        // Refine scanlines with perspective fit for clean smooth road mesh
+        // Generate clean, smooth, mathematically continuous perspective road boundaries (zero zigzags)
         for (int si = 0; si < scanlineCount; si++) {
           final double yNorm = roiTopFrac + (roiBottomFrac - roiTopFrac) * (si / scanlineCount);
-          final double progress = (yNorm - vpY).clamp(0.02, 1.0);
+          final double fittedLeft = (mL * yNorm + cL).clamp(0.04, 0.48);
+          final double fittedRight = (mR * yNorm + cR).clamp(0.52, 0.96);
 
-          // Perspective beam spreading outward from VP
-          final double fittedLeft = (vpX - (vpX - leftEdgeX[si]) * (progress / (0.88 - vpY))).clamp(0.04, 0.48);
-          final double fittedRight = (vpX + (rightEdgeX[si] - vpX) * (progress / (0.88 - vpY))).clamp(0.52, 0.96);
-
-          if (edgeConfidence[si] > 0.1) {
-            leftEdgeX[si] = 0.7 * leftEdgeX[si] + 0.3 * fittedLeft;
-            rightEdgeX[si] = 0.7 * rightEdgeX[si] + 0.3 * fittedRight;
-          } else {
-            leftEdgeX[si] = fittedLeft;
-            rightEdgeX[si] = fittedRight;
-          }
-          widthPx[si] = (rightEdgeX[si] - leftEdgeX[si]) * width;
+          leftEdgeX[si] = fittedLeft;
+          rightEdgeX[si] = fittedRight;
+          edgeConfidence[si] = math.max(0.55, edgeConfidence[si]);
+          widthPx[si] = (fittedRight - fittedLeft) * width;
         }
       }
     }

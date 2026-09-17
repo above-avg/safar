@@ -15,13 +15,14 @@ import '../widgets/hud_overlay_painter.dart';
 import '../widgets/live_hud_card.dart';
 
 class LiveSurveyScreen extends StatefulWidget {
-  const LiveSurveyScreen({super.key});
+  final bool isActive;
+  const LiveSurveyScreen({super.key, this.isActive = true});
 
   @override
   State<LiveSurveyScreen> createState() => _LiveSurveyScreenState();
 }
 
-class _LiveSurveyScreenState extends State<LiveSurveyScreen> {
+class _LiveSurveyScreenState extends State<LiveSurveyScreen> with WidgetsBindingObserver {
   CameraController? _cameraController;
   bool _isCameraReady = false;
   bool _hasCameraPermission = false;
@@ -110,12 +111,63 @@ class _LiveSurveyScreenState extends State<LiveSurveyScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _initFrameProcessor();
-    _checkPermissionsAndInitCamera();
+    if (widget.isActive) {
+      _checkPermissionsAndInitCamera();
+    }
+  }
+
+  @override
+  void didUpdateWidget(LiveSurveyScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.isActive != widget.isActive) {
+      if (widget.isActive) {
+        _resumeCamera();
+      } else {
+        _pauseCamera();
+      }
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused || state == AppLifecycleState.inactive) {
+      _pauseCamera();
+    } else if (state == AppLifecycleState.resumed && widget.isActive) {
+      _resumeCamera();
+    }
+  }
+
+  Future<void> _pauseCamera() async {
+    _simulationTimer?.cancel();
+    await _stopImageStream();
+    await _cameraController?.dispose();
+    _cameraController = null;
+    if (mounted) {
+      setState(() {
+        _isCameraReady = false;
+        _isStreamingFrames = false;
+      });
+    }
+  }
+
+  Future<void> _resumeCamera() async {
+    if (!widget.isActive) return;
+    if (_isDemoMode) {
+      _startFallbackSimulation();
+      return;
+    }
+    if (_hasCameraPermission) {
+      await _initCamera();
+    } else {
+      _checkPermissionsAndInitCamera();
+    }
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _simulationTimer?.cancel();
     _stopImageStream();
     _cameraController?.dispose();
