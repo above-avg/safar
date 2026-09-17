@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Miscellaneous
 *.class
 *.log
@@ -48,3 +49,12 @@ build/
 # Symbolication / Obfuscation
 app.*.symbols
 app.*.map.json
+=======
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+data/
+.cache/
+*.log
+>>>>>>> master
