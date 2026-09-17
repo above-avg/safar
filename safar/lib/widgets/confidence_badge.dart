@@ -39,6 +39,11 @@ class ConfidenceBadge extends StatelessWidget {
         iconData = Icons.warning_amber_outlined;
         labelText = 'LOW';
         break;
+      case 'NO ROAD':
+      case 'NONE':
+        iconData = Icons.videocam_off_outlined;
+        labelText = 'NO ROAD';
+        break;
       default:
         iconData = Icons.help_outline;
         labelText = cleanTier;

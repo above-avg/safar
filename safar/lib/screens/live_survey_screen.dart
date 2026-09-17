@@ -212,6 +212,14 @@ class _LiveSurveyScreenState extends State<LiveSurveyScreen> with WidgetsBinding
           _madM = 1.4826 * deviations[deviations.length ~/ 2];
         }
       });
+    } else if (!_isTapMeasureActive && !_isDemoMode) {
+      _widthBuffer.clear();
+      setState(() {
+        _currentWidthM = 0.0;
+        _currentTier = 'NO ROAD';
+        _observationCount = 0;
+        _madM = 0.0;
+      });
     }
 
     setState(() {
@@ -551,13 +559,13 @@ class _LiveSurveyScreenState extends State<LiveSurveyScreen> with WidgetsBinding
                       child: Text(
                         _isDemoMode
                             ? 'DEMO ROAD | ${_currentWidthM < 3.5 ? "PINCH ALERT!" : "OK"}'
-                            : '${_processingFps.toStringAsFixed(1)} FPS | ${isLive ? (_leftEdgePoints.isEmpty ? "SCANNING" : "TRACKING") : "NO CAM"}',
+                            : '${_processingFps.toStringAsFixed(1)} FPS | ${isLive ? (_leftEdgePoints.isEmpty ? "NO ROAD" : "ROAD LOCKED") : "NO CAM"}',
                         style: SafarTokens.fontMono(
                           fontSize: 10.5,
                           fontWeight: FontWeight.w800,
                           color: _isDemoMode
                               ? (_currentWidthM < 3.5 ? SafarTokens.confLow : SafarTokens.paint)
-                              : (_leftEdgePoints.isNotEmpty ? SafarTokens.confHigh : SafarTokens.hivis),
+                              : (_leftEdgePoints.isNotEmpty ? SafarTokens.confHigh : SafarTokens.asphalt400),
                         ),
                       ),
                     ),
@@ -776,7 +784,7 @@ class _LiveSurveyScreenState extends State<LiveSurveyScreen> with WidgetsBinding
             // 7. Floating Overlay Layer Controls (Right side)
             Positioned(
               right: 12,
-              top: _showInstructions ? 140 : 16,
+              top: _showInstructions ? 150 : 54, // Positioned below top bar to eliminate collision with FPS meter
               child: Container(
                 padding: const EdgeInsets.all(6),
                 decoration: BoxDecoration(

@@ -59,6 +59,32 @@ void _processFrameIsolate(SendPort sendPort) {
         sensorOrientation: sensorOrientation,
       );
 
+      // Check if a road was actually detected (avoid showing fake lines on floors/walls/desks)
+      if (!segResult.isRoadDetected || segResult.validScanlines < 5 || segResult.leftEdgeX.isEmpty) {
+        stopwatch.stop();
+        replyTo.send([
+          <List<double>>[], // 0: leftEdgePoints empty
+          <List<double>>[], // 1: rightEdgePoints empty
+          null, // 2: roadWidthM null
+          0.50, // 3: halfWidthM
+          'NO ROAD', // 4: tier
+          [0.50, 0.38], // 5: vanishingPoint
+          null, // 6: vpPitchDeg
+          <List<double>>[], // 7: maskPoly empty
+          false, // 8: hasOcclusion
+          0.0, // 9: imuRms
+          'NONE', // 10: edgeLeftType
+          'NONE', // 11: edgeRightType
+          10.0, // 12: meanRangeM
+          0.0, // 13: coverage
+          stopwatch.elapsedMilliseconds, // 14
+          portraitW, // 15
+          portraitH, // 16
+          0, // 17: validScanlines
+        ]);
+        return;
+      }
+
       // 2. Vanishing point
       final vpResult = vpEstimator.estimate(
         yPlane: yPlane,

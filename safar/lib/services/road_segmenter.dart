@@ -34,6 +34,9 @@ class SegmentationResult {
   /// Estimated road width in pixels at each valid scanline.
   final Float32List widthPx;
 
+  /// Whether a valid road was actually detected in this frame (false for indoor/non-road scenes).
+  final bool isRoadDetected;
+
   const SegmentationResult({
     required this.leftEdgeX,
     required this.rightEdgeX,
@@ -43,7 +46,23 @@ class SegmentationResult {
     required this.validScanlines,
     required this.totalScanlines,
     required this.widthPx,
+    this.isRoadDetected = true,
   });
+
+  /// Factory for when no road is in view (e.g. indoor room, ceiling, desk, wall)
+  static SegmentationResult empty(int count) {
+    return SegmentationResult(
+      leftEdgeX: Float32List(0),
+      rightEdgeX: Float32List(0),
+      edgeConfidence: Float32List(0),
+      vpX: 0.50,
+      vpY: 0.38,
+      validScanlines: 0,
+      totalScanlines: count,
+      widthPx: Float32List(0),
+      isRoadDetected: false,
+    );
+  }
 
   /// Fraction of scanlines with valid edges.
   double get coverage => totalScanlines > 0 ? validScanlines / totalScanlines : 0.0;
@@ -63,11 +82,21 @@ abstract class RoadSegmenter {
   });
 }
 
-/// Robust Classical Road Segmenter using Sobel gradient and outside-in curb tracking.
+/// Robust Classical Road Segmenter using Sobel gradient, outside-in curb tracking,
+/// and temporal exponential moving average smoothing for steady perspective edges.
 class ClassicalRoadSegmenter implements RoadSegmenter {
   final int gradientThreshold;
   final int maxEdgeJumpPx;
   final int smoothKernel;
+
+  // Temporal Exponential Moving Average (EMA) state across frames to eliminate jitter
+  double? _smoothML;
+  double? _smoothCL;
+  double? _smoothMR;
+  double? _smoothCR;
+  double? _smoothVpX;
+  double? _smoothVpY;
+  int _consecutiveLostFrames = 0;
 
   // Working resolution in portrait space for low-latency, noise-free processing
   static const int _workW = 240;
@@ -213,49 +242,106 @@ class ClassicalRoadSegmenter implements RoadSegmenter {
       }
     }
 
-    // Estimate vanishing point via linear perspective regression
-    double vpX = 0.50;
-    double vpY = 0.38;
-
-    if (validCount >= 4 && leftPointsX.length >= 4 && rightPointsX.length >= 4) {
-      final vpEstimate = _fitPerspectiveBeam(
+    // Estimate vanishing point and perspective beam via linear regression
+    List<double>? vpEstimate;
+    if (validCount >= 6 && leftPointsX.length >= 6 && rightPointsX.length >= 6) {
+      vpEstimate = _fitPerspectiveBeam(
         leftPointsX,
         leftPointsY,
         rightPointsX,
         rightPointsY,
       );
-      if (vpEstimate != null) {
-        vpX = vpEstimate[0];
-        vpY = vpEstimate[1];
-        final double mL = vpEstimate[2];
-        final double cL = vpEstimate[3];
-        final double mR = vpEstimate[4];
-        final double cR = vpEstimate[5];
+    }
 
-        // Generate clean, smooth, mathematically continuous perspective road boundaries (zero zigzags)
+    if (vpEstimate != null) {
+      _consecutiveLostFrames = 0;
+      final double vpX = vpEstimate[0];
+      final double vpY = vpEstimate[1];
+      final double mL = vpEstimate[2];
+      final double cL = vpEstimate[3];
+      final double mR = vpEstimate[4];
+      final double cR = vpEstimate[5];
+
+      // Temporal Exponential Moving Average (EMA) to eliminate frame-to-frame edge jitter
+      if (_smoothML != null) {
+        _smoothML = 0.25 * mL + 0.75 * _smoothML!;
+        _smoothCL = 0.25 * cL + 0.75 * _smoothCL!;
+        _smoothMR = 0.25 * mR + 0.75 * _smoothMR!;
+        _smoothCR = 0.25 * cR + 0.75 * _smoothCR!;
+        _smoothVpX = 0.25 * vpX + 0.75 * _smoothVpX!;
+        _smoothVpY = 0.25 * vpY + 0.75 * _smoothVpY!;
+      } else {
+        _smoothML = mL;
+        _smoothCL = cL;
+        _smoothMR = mR;
+        _smoothCR = cR;
+        _smoothVpX = vpX;
+        _smoothVpY = vpY;
+      }
+
+      // Generate clean, smooth, mathematically continuous perspective road boundaries
+      for (int si = 0; si < scanlineCount; si++) {
+        final double yNorm = roiTopFrac + (roiBottomFrac - roiTopFrac) * (si / scanlineCount);
+        final double fittedLeft = (_smoothML! * yNorm + _smoothCL!).clamp(0.04, 0.48);
+        final double fittedRight = (_smoothMR! * yNorm + _smoothCR!).clamp(0.52, 0.96);
+
+        leftEdgeX[si] = fittedLeft;
+        rightEdgeX[si] = fittedRight;
+        edgeConfidence[si] = 0.85;
+        widthPx[si] = (fittedRight - fittedLeft) * width;
+      }
+
+      return SegmentationResult(
+        leftEdgeX: leftEdgeX,
+        rightEdgeX: rightEdgeX,
+        edgeConfidence: edgeConfidence,
+        vpX: _smoothVpX!,
+        vpY: _smoothVpY!,
+        validScanlines: validCount,
+        totalScanlines: scanlineCount,
+        widthPx: widthPx,
+        isRoadDetected: true,
+      );
+    } else {
+      // No perspective road detected in this frame (e.g. room, wall, desk, non-road)
+      _consecutiveLostFrames++;
+      if (_consecutiveLostFrames >= 2) {
+        _smoothML = null;
+        _smoothCL = null;
+        _smoothMR = null;
+        _smoothCR = null;
+        _smoothVpX = null;
+        _smoothVpY = null;
+        return SegmentationResult.empty(scanlineCount);
+      }
+
+      // If only 1 frame dropped, coast smoothly on the previous smoothed model
+      if (_smoothML != null) {
         for (int si = 0; si < scanlineCount; si++) {
           final double yNorm = roiTopFrac + (roiBottomFrac - roiTopFrac) * (si / scanlineCount);
-          final double fittedLeft = (mL * yNorm + cL).clamp(0.04, 0.48);
-          final double fittedRight = (mR * yNorm + cR).clamp(0.52, 0.96);
+          final double fittedLeft = (_smoothML! * yNorm + _smoothCL!).clamp(0.04, 0.48);
+          final double fittedRight = (_smoothMR! * yNorm + _smoothCR!).clamp(0.52, 0.96);
 
           leftEdgeX[si] = fittedLeft;
           rightEdgeX[si] = fittedRight;
-          edgeConfidence[si] = math.max(0.55, edgeConfidence[si]);
+          edgeConfidence[si] = 0.60;
           widthPx[si] = (fittedRight - fittedLeft) * width;
         }
+        return SegmentationResult(
+          leftEdgeX: leftEdgeX,
+          rightEdgeX: rightEdgeX,
+          edgeConfidence: edgeConfidence,
+          vpX: _smoothVpX ?? 0.50,
+          vpY: _smoothVpY ?? 0.38,
+          validScanlines: 4,
+          totalScanlines: scanlineCount,
+          widthPx: widthPx,
+          isRoadDetected: true,
+        );
       }
-    }
 
-    return SegmentationResult(
-      leftEdgeX: leftEdgeX,
-      rightEdgeX: rightEdgeX,
-      edgeConfidence: edgeConfidence,
-      vpX: vpX,
-      vpY: vpY,
-      validScanlines: validCount,
-      totalScanlines: scanlineCount,
-      widthPx: widthPx,
-    );
+      return SegmentationResult.empty(scanlineCount);
+    }
   }
 
   /// Resample raw Y-plane into portrait working buffer taking rotation into account.
@@ -327,11 +413,19 @@ class ClassicalRoadSegmenter implements RoadSegmenter {
     final double vpY = (cR - cL) / (mL - mR);
     final double vpX = mL * vpY + cL;
 
-    if (vpY < 0.05 || vpY > 0.55 || vpX < 0.15 || vpX > 0.85) {
+    // Vanishing point must be in upper horizon portion of screen
+    if (vpY < 0.05 || vpY > 0.58 || vpX < 0.15 || vpX > 0.85) {
       return null;
     }
 
-    return [vpX, vpY];
+    // Perspective widening check: road must be wider at the bottom (near field) than top (far field)
+    final double wBottom = (mR * 0.88 + cR) - (mL * 0.88 + cL);
+    final double wTop = (mR * 0.38 + cR) - (mL * 0.38 + cL);
+    if (wBottom <= wTop * 1.08 || wBottom < 0.18 || wBottom > 0.98) {
+      return null;
+    }
+
+    return [vpX, vpY, mL, cL, mR, cR];
   }
 
   /// Linear regression: x = m * y + c

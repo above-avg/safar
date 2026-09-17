@@ -57,14 +57,8 @@ class HudOverlayPainter extends CustomPainter {
         ? size.width * dynamicVP![0]
         : size.width * 0.50;
 
-    // Measurement band Y positions (near = 5m, far = 15m)
+    // Measurement band near Y position (near = 5m)
     final double nearY = size.height * 0.88;
-    final double farY = size.height * 0.52;
-
-    // Static road boundaries at far edge of trusted band (fallback)
-    final double farRoadHalfW = size.width * 0.16;
-    final double farRoadL = vpX - farRoadHalfW;
-    final double farRoadR = vpX + farRoadHalfW;
 
     // Interactive tap measurement overlay
     if (tapPointA != null) {
@@ -82,13 +76,10 @@ class HudOverlayPainter extends CustomPainter {
       if (useDynamicEdges && dynamicMaskPoly.length >= 3) {
         // Dynamic carriageway mask from frame processor
         _drawDynamicCarriagewayMask(canvas, size);
-      } else if (!isLiveSearching) {
-        // Static fallback
-        _drawStaticCarriagewayMask(canvas, size, vpX, vpY, nearY, farY, farRoadL, farRoadR);
       }
 
       // Occlusion Hatch (if vehicle present)
-      if (hasOcclusion) {
+      if (hasOcclusion && useDynamicEdges) {
         _drawOcclusionHatch(canvas, size, vpX, nearY);
       }
     }
@@ -97,16 +88,11 @@ class HudOverlayPainter extends CustomPainter {
     if (showTransectLadder) {
       if (useDynamicEdges && dynamicLeftEdge.length >= 2 && dynamicRightEdge.length >= 2) {
         _drawDynamicTransectLadder(canvas, size);
-      } else if (!isLiveSearching) {
-        _drawStaticTransectLadder(canvas, size, vpX, nearY, farY, farRoadL, farRoadR);
+        _drawBandLabel(canvas, '15 m FAR LIMIT', Offset(dynamicLeftEdge.first[0] * size.width - 10, dynamicLeftEdge.first[1] * size.height - 14));
+        _drawBandLabel(canvas, '5 m NEAR LIMIT', Offset(dynamicLeftEdge.last[0] * size.width - 10, dynamicLeftEdge.last[1] * size.height + 6));
       } else {
+        // No road detected: draw clean searching reticle
         _drawSearchingGuide(canvas, size, vpX, vpY);
-      }
-
-      // Band boundary labels
-      if (!isLiveSearching || useDynamicEdges) {
-        _drawBandLabel(canvas, '15 m FAR LIMIT', Offset(farRoadL - 10, farY - 14));
-        _drawBandLabel(canvas, '5 m NEAR LIMIT', Offset(vpX - size.width * 0.38, nearY + 6));
       }
     }
 
@@ -178,65 +164,6 @@ class HudOverlayPainter extends CustomPainter {
     canvas.drawPath(maskPath, roadStroke);
   }
 
-  /// Draw the static fallback carriageway mask.
-  void _drawStaticCarriagewayMask(
-    Canvas canvas, Size size,
-    double vpX, double vpY, double nearY, double farY,
-    double farRoadL, double farRoadR,
-  ) {
-    final Path roadBandPath = Path()
-      ..moveTo(vpX - size.width * 0.38, nearY)
-      ..lineTo(farRoadL, farY)
-      ..lineTo(farRoadR, farY)
-      ..lineTo(vpX + size.width * 0.38, nearY)
-      ..close();
-
-    final Paint roadFill = Paint()
-      ..color = SafarTokens.segCarriageway.withValues(alpha: 0.30)
-      ..style = PaintingStyle.fill;
-    canvas.drawPath(roadBandPath, roadFill);
-
-    final Paint roadStroke = Paint()
-      ..color = SafarTokens.segCarriageway
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 2.0;
-    canvas.drawPath(roadBandPath, roadStroke);
-
-    // Left Kerb
-    final Paint kerbPaint = Paint()
-      ..color = SafarTokens.segKerb
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 3.0;
-    canvas.drawLine(
-      Offset(vpX - size.width * 0.40, size.height),
-      Offset(vpX - size.width * 0.10, vpY),
-      kerbPaint,
-    );
-
-    // Right Shoulder
-    final Path shoulderPath = Path()
-      ..moveTo(vpX + size.width * 0.38, nearY)
-      ..lineTo(farRoadR, farY)
-      ..lineTo(farRoadR + 25.0, farY)
-      ..lineTo(vpX + size.width * 0.48, nearY)
-      ..close();
-    final Paint shoulderFill = Paint()
-      ..color = SafarTokens.segShoulder.withValues(alpha: 0.22)
-      ..style = PaintingStyle.fill;
-    canvas.drawPath(shoulderPath, shoulderFill);
-
-    // Dashed lane marking
-    final Paint markingPaint = Paint()
-      ..color = SafarTokens.segMarking
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 2.5;
-    for (double t = 0.1; t < 0.9; t += 0.14) {
-      final double y1 = farY + (nearY - farY) * t;
-      final double y2 = farY + (nearY - farY) * (t + 0.08);
-      canvas.drawLine(Offset(vpX, y1), Offset(vpX, y2), markingPaint);
-    }
-  }
-
   /// Draw the transect ladder using dynamically detected edge positions.
   void _drawDynamicTransectLadder(Canvas canvas, Size size) {
     final Paint ladderPaint = Paint()
@@ -291,46 +218,6 @@ class HudOverlayPainter extends CustomPainter {
         bandBoundaryPaint,
       );
     }
-  }
-
-  /// Draw the static fallback transect ladder.
-  void _drawStaticTransectLadder(
-    Canvas canvas, Size size,
-    double vpX, double nearY, double farY,
-    double farRoadL, double farRoadR,
-  ) {
-    final Paint ladderPaint = Paint()
-      ..color = SafarTokens.hivis
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 1.8;
-
-    final Paint ladderCap = Paint()
-      ..color = SafarTokens.paint
-      ..style = PaintingStyle.fill;
-
-    const int rungCount = 10;
-    for (int i = 0; i <= rungCount; i++) {
-      final double frac = i / rungCount.toDouble();
-      final double pFrac = math.pow(frac, 1.4).toDouble();
-      final double rungY = nearY - (nearY - farY) * pFrac;
-
-      final double leftX = (vpX - size.width * 0.38) +
-          (farRoadL - (vpX - size.width * 0.38)) * pFrac;
-      final double rightX = (vpX + size.width * 0.38) +
-          (farRoadR - (vpX + size.width * 0.38)) * pFrac;
-
-      canvas.drawLine(Offset(leftX, rungY), Offset(rightX, rungY), ladderPaint);
-      canvas.drawCircle(Offset(leftX, rungY), 2.5, ladderCap);
-      canvas.drawCircle(Offset(rightX, rungY), 2.5, ladderCap);
-    }
-
-    // Band boundary lines
-    final Paint bandBoundaryPaint = Paint()
-      ..color = SafarTokens.hivisDim
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 1.2;
-    canvas.drawLine(Offset(farRoadL - 20, farY), Offset(farRoadR + 20, farY), bandBoundaryPaint);
-    canvas.drawLine(Offset(vpX - size.width * 0.40, nearY), Offset(vpX + size.width * 0.40, nearY), bandBoundaryPaint);
   }
 
   /// Draw detected edge lines as continuous polylines.
