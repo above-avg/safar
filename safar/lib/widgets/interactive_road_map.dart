@@ -40,6 +40,7 @@ class _InteractiveRoadMapState extends State<InteractiveRoadMap> {
   MapSegmentData? _selectedSegment;
   MapFilterMode _filterMode = MapFilterMode.allWidths;
   bool _showCallout = true;
+  bool _showRoadWidthLabels = true;
   LatLng? _userLiveLocation;
   bool _isLocating = false;
 
@@ -221,6 +222,74 @@ class _InteractiveRoadMapState extends State<InteractiveRoadMap> {
       }
     }
 
+    // Road measurement badges directly beside each road segment
+    if (_showRoadWidthLabels) {
+      for (int i = 0; i < widget.segments.length; i++) {
+        final seg = widget.segments[i];
+        final bool isPinch = seg.widthM < 3.5;
+        final bool isKey = isPinch || (i % 2 == 0) || (i == widget.segments.length - 1);
+        if (isKey) {
+          markers.add(
+            Marker(
+              point: seg.position,
+              width: 80,
+              height: 26,
+              alignment: Alignment.topRight, // Positions directly beside the road polyline
+              child: GestureDetector(
+                onTap: () {
+                  setState(() {
+                    _selectedSegment = seg;
+                    _showCallout = true;
+                  });
+                  widget.onSegmentSelected?.call(seg);
+                },
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+                  decoration: BoxDecoration(
+                    color: isPinch
+                        ? SafarTokens.confLow
+                        : (seg.widthM < 4.0
+                            ? SafarTokens.confMed
+                            : SafarTokens.asphalt950.withValues(alpha: 0.92)),
+                    borderRadius: BorderRadius.circular(4),
+                    border: Border.all(
+                      color: isPinch
+                          ? Colors.white
+                          : (seg.widthM < 4.0 ? SafarTokens.asphalt950 : SafarTokens.hivis),
+                      width: 1.2,
+                    ),
+                    boxShadow: const [
+                      BoxShadow(color: Colors.black54, blurRadius: 3, offset: Offset(0, 1)),
+                    ],
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      if (isPinch) ...[
+                        const Icon(Icons.warning_amber, size: 11, color: Colors.white),
+                        const SizedBox(width: 2),
+                      ],
+                      Text(
+                        '${seg.widthM.toStringAsFixed(1)}m',
+                        style: SafarTokens.fontMono(
+                          fontSize: 10.5,
+                          fontWeight: FontWeight.w800,
+                          color: isPinch
+                              ? Colors.white
+                              : (seg.widthM < 4.0 ? SafarTokens.asphalt950 : SafarTokens.hivis),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          );
+        }
+      }
+    }
+
     return Stack(
       children: [
         // Free OpenStreetMap Standard Tiles (100% Free, Public, No API Key Required)
@@ -312,6 +381,12 @@ class _InteractiveRoadMapState extends State<InteractiveRoadMap> {
                 icon: Icons.help_outline,
                 tooltip: 'Map Legend & Gestures',
                 onTap: _showLegendDialog,
+              ),
+              const SizedBox(height: 8),
+              _buildMapButton(
+                icon: _showRoadWidthLabels ? Icons.straighten : Icons.format_list_bulleted,
+                tooltip: _showRoadWidthLabels ? 'Hide Road Width Badges' : 'Show Road Widths Beside Roads',
+                onTap: () => setState(() => _showRoadWidthLabels = !_showRoadWidthLabels),
               ),
             ],
           ),

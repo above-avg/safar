@@ -2,8 +2,8 @@
 // Classical computer vision approach: luminance gradient edge detection on Y-plane.
 // No ML model in the loop -- per project requirement.
 //
-// The segmenter operates on raw NV21/YUV420 luminance bytes and produces
-// left/right road edge positions per scanline within the trusted 5-15m band.
+// The segmenter handles sensor rotation (portrait phone orientation vs landscape camera sensor),
+// outside-in edge peak detection to avoid middle-lane vehicle occlusion, and perspective line fitting.
 
 import 'dart:math' as math;
 import 'dart:typed_data';
@@ -53,42 +53,29 @@ class SegmentationResult {
 /// Implementations must be safe to call from an Isolate (no Flutter bindings).
 abstract class RoadSegmenter {
   /// Process a single frame's luminance plane.
-  ///
-  /// [yPlane] -- raw Y-channel bytes (width * height).
-  /// [width], [height] -- image dimensions.
-  /// [roiTopFrac], [roiBottomFrac] -- vertical region of interest as fraction of image height
-  ///   (0.0 = top, 1.0 = bottom). Maps to the 5-15m measurement band.
   SegmentationResult segment({
     required Uint8List yPlane,
     required int width,
     required int height,
     double roiTopFrac = 0.35,
     double roiBottomFrac = 0.90,
+    int sensorOrientation = 90,
   });
 }
 
-/// Classical road segmenter using Sobel-gradient edge detection on the Y-plane.
-///
-/// Algorithm overview:
-/// 1. Extract horizontal ROI scanlines within the 5-15m measurement band.
-/// 2. For each scanline, compute the horizontal Sobel gradient |dI/dx|.
-/// 3. Find the two strongest gradient peaks on the left and right halves,
-///    which correspond to the road edge transitions (asphalt-to-kerb or lane paint).
-/// 4. Apply hysteresis: reject edges that jump more than a threshold between adjacent scanlines.
-/// 5. Estimate vanishing point as the intersection of the two edge lines (linear regression).
+/// Robust Classical Road Segmenter using Sobel gradient and outside-in curb tracking.
 class ClassicalRoadSegmenter implements RoadSegmenter {
-  /// Minimum gradient magnitude to consider as a candidate edge.
   final int gradientThreshold;
-
-  /// Maximum allowed horizontal jump between adjacent scanlines (in pixels) before edge is rejected.
   final int maxEdgeJumpPx;
-
-  /// Smoothing kernel half-width for gradient computation.
   final int smoothKernel;
 
+  // Working resolution in portrait space for low-latency, noise-free processing
+  static const int _workW = 240;
+  static const int _workH = 320;
+
   ClassicalRoadSegmenter({
-    this.gradientThreshold = 18,
-    this.maxEdgeJumpPx = 12,
+    this.gradientThreshold = 14,
+    this.maxEdgeJumpPx = 18,
     this.smoothKernel = 2,
   });
 
@@ -99,113 +86,167 @@ class ClassicalRoadSegmenter implements RoadSegmenter {
     required int height,
     double roiTopFrac = 0.35,
     double roiBottomFrac = 0.90,
+    int sensorOrientation = 90,
   }) {
-    final int roiTop = (height * roiTopFrac).round();
-    final int roiBottom = (height * roiBottomFrac).round();
-    final int scanlineCount = roiBottom - roiTop;
-
-    if (scanlineCount <= 0 || width < 20) {
-      return _emptyResult(scanlineCount);
+    if (width < 20 || height < 20 || yPlane.isEmpty) {
+      return _emptyResult(30);
     }
+
+    // Determine effective sensor rotation.
+    // If width > height and device is used in portrait mode, Android camera frames
+    // are rotated 90 degrees relative to the UI screen.
+    final bool isSensorLandscape = width > height;
+    final int effectiveRotation = isSensorLandscape ? sensorOrientation : 0;
+
+    // Resample into portrait working buffer (240x320)
+    final workBuffer = Uint8List(_workW * _workH);
+    _samplePortraitBuffer(
+      src: yPlane,
+      srcW: width,
+      srcH: height,
+      dst: workBuffer,
+      dstW: _workW,
+      dstH: _workH,
+      rotationDeg: effectiveRotation,
+    );
+
+    final int roiTop = (_workH * roiTopFrac).round().clamp(2, _workH - 10);
+    final int roiBottom = (_workH * roiBottomFrac).round().clamp(roiTop + 5, _workH - 2);
+    final int scanlineCount = roiBottom - roiTop;
 
     final leftEdgeX = Float32List(scanlineCount);
     final rightEdgeX = Float32List(scanlineCount);
     final edgeConfidence = Float32List(scanlineCount);
     final widthPx = Float32List(scanlineCount);
 
-    int validCount = 0;
-    int? prevLeftPx;
-    int? prevRightPx;
+    final List<double> leftPointsX = [];
+    final List<double> leftPointsY = [];
+    final List<double> rightPointsX = [];
+    final List<double> rightPointsY = [];
 
-    // Process each scanline from bottom (near = 5m) to top (far = 15m)
+    int validCount = 0;
+
+    // Process each scanline in the ROI from bottom (near field) to top (horizon field)
     for (int si = scanlineCount - 1; si >= 0; si--) {
       final int y = roiTop + si;
-      final int rowOffset = y * width;
+      final int rowOffset = y * _workW;
+      final double yNorm = y / _workH;
 
-      // Compute horizontal gradient magnitude across the scanline
-      // using a simple central-difference Sobel-like operator with smoothing.
-      final gradients = Int32List(width);
-      for (int x = smoothKernel + 1; x < width - smoothKernel - 1; x++) {
-        int sumLeft = 0;
-        int sumRight = 0;
-        for (int k = -smoothKernel; k <= smoothKernel; k++) {
-          sumLeft += yPlane[rowOffset + x - 1 + k * width.sign];
-          sumRight += yPlane[rowOffset + x + 1 + k * width.sign];
-        }
-        gradients[x] = ((sumRight - sumLeft) / (2 * smoothKernel + 1)).abs().round();
+      // Compute horizontal Sobel gradient |dI/dx| with vertical 3-row smoothing
+      final gradients = Int32List(_workW);
+      int sumGrad = 0;
+      int gradSamples = 0;
+
+      for (int x = 2; x < _workW - 2; x++) {
+        // Vertical 3-row smoothed horizontal gradient
+        final int leftSum = workBuffer[(y - 1) * _workW + x - 1] +
+            2 * workBuffer[rowOffset + x - 1] +
+            workBuffer[(y + 1) * _workW + x - 1];
+
+        final int rightSum = workBuffer[(y - 1) * _workW + x + 1] +
+            2 * workBuffer[rowOffset + x + 1] +
+            workBuffer[(y + 1) * _workW + x + 1];
+
+        final int g = ((rightSum - leftSum) / 4).abs().round();
+        gradients[x] = g;
+        sumGrad += g;
+        gradSamples++;
       }
 
-      final int midX = width ~/ 2;
+      final double avgGrad = gradSamples > 0 ? sumGrad / gradSamples : 0;
+      final int dynamicThreshold = math.max(gradientThreshold, (avgGrad * 1.3).round());
 
-      // Find strongest gradient peak in left half (road left edge)
+      // Outside-in scan:
+      // Left edge: scan from left margin (5% to 46% of width)
+      // This detects the true curb/shoulder line and ignores center vehicles
       int bestLeftX = -1;
-      int bestLeftGrad = gradientThreshold;
-      for (int x = midX ~/ 4; x < midX; x++) {
+      int bestLeftGrad = dynamicThreshold;
+      final int leftStart = math.max(3, (_workW * 0.04).round());
+      final int leftEnd = (_workW * 0.46).round();
+
+      for (int x = leftStart; x <= leftEnd; x++) {
         if (gradients[x] > bestLeftGrad) {
           bestLeftGrad = gradients[x];
           bestLeftX = x;
         }
       }
 
-      // Find strongest gradient peak in right half (road right edge)
+      // Right edge: scan from right margin (96% down to 54% of width)
       int bestRightX = -1;
-      int bestRightGrad = gradientThreshold;
-      for (int x = midX; x < width - (midX ~/ 4); x++) {
+      int bestRightGrad = dynamicThreshold;
+      final int rightStart = math.min(_workW - 4, (_workW * 0.96).round());
+      final int rightEnd = (_workW * 0.54).round();
+
+      for (int x = rightStart; x >= rightEnd; x--) {
         if (gradients[x] > bestRightGrad) {
           bestRightGrad = gradients[x];
           bestRightX = x;
         }
       }
 
-      // Hysteresis: reject large jumps from previous scanline
-      if (prevLeftPx != null && bestLeftX >= 0) {
-        if ((bestLeftX - prevLeftPx).abs() > maxEdgeJumpPx) {
-          bestLeftX = -1; // Reject
-        }
-      }
-      if (prevRightPx != null && bestRightX >= 0) {
-        if ((bestRightX - prevRightPx).abs() > maxEdgeJumpPx) {
-          bestRightX = -1;
-        }
-      }
+      // Check if both edges are plausible
+      if (bestLeftX >= 0 && bestRightX >= 0 && (bestRightX - bestLeftX) >= (_workW * 0.18)) {
+        final double lxNorm = bestLeftX / _workW;
+        final double rxNorm = bestRightX / _workW;
+        final double conf = ((bestLeftGrad + bestRightGrad) / 60.0).clamp(0.2, 1.0);
 
-      if (bestLeftX >= 0 && bestRightX >= 0 && bestRightX > bestLeftX) {
-        leftEdgeX[si] = bestLeftX / width;
-        rightEdgeX[si] = bestRightX / width;
-        widthPx[si] = (bestRightX - bestLeftX).toDouble();
+        leftEdgeX[si] = lxNorm;
+        rightEdgeX[si] = rxNorm;
+        edgeConfidence[si] = conf;
+        widthPx[si] = (bestRightX - bestLeftX) * (width / _workW);
 
-        // Confidence: normalised average gradient strength
-        final double avgGrad = (bestLeftGrad + bestRightGrad) / 2.0;
-        edgeConfidence[si] = (avgGrad / 80.0).clamp(0.0, 1.0);
+        leftPointsX.add(lxNorm);
+        leftPointsY.add(yNorm);
+        rightPointsX.add(rxNorm);
+        rightPointsY.add(yNorm);
 
-        prevLeftPx = bestLeftX;
-        prevRightPx = bestRightX;
         validCount++;
       } else {
-        // Interpolate from previous valid scanline if available
-        if (prevLeftPx != null && prevRightPx != null) {
-          leftEdgeX[si] = prevLeftPx / width;
-          rightEdgeX[si] = prevRightPx / width;
-          widthPx[si] = (prevRightPx - prevLeftPx).toDouble();
-          edgeConfidence[si] = 0.2; // Low confidence for interpolated
-        } else {
-          leftEdgeX[si] = 0.25;
-          rightEdgeX[si] = 0.75;
-          widthPx[si] = width * 0.5;
-          edgeConfidence[si] = 0.0;
-        }
+        // Perspective fallback for this scanline
+        // In typical dashcam perspective: near width ~ 0.65-0.75, far width ~ 0.20-0.30
+        final double t = si / scanlineCount; // 0 = far, 1 = near
+        final double expectedHalfW = 0.12 + 0.25 * t;
+        leftEdgeX[si] = (0.50 - expectedHalfW).clamp(0.05, 0.45);
+        rightEdgeX[si] = (0.50 + expectedHalfW).clamp(0.55, 0.95);
+        edgeConfidence[si] = 0.0;
+        widthPx[si] = (rightEdgeX[si] - leftEdgeX[si]) * width;
       }
     }
 
-    // Estimate vanishing point via linear regression of edge lines
-    double vpX = 0.5;
+    // Estimate vanishing point via linear perspective regression
+    double vpX = 0.50;
     double vpY = 0.38;
-    if (validCount >= 4) {
-      final vpEstimate = _estimateVanishingPoint(
-        leftEdgeX, rightEdgeX, edgeConfidence, scanlineCount, roiTopFrac, roiBottomFrac,
+
+    if (validCount >= 4 && leftPointsX.length >= 4 && rightPointsX.length >= 4) {
+      final vpEstimate = _fitPerspectiveBeam(
+        leftPointsX,
+        leftPointsY,
+        rightPointsX,
+        rightPointsY,
       );
-      vpX = vpEstimate[0];
-      vpY = vpEstimate[1];
+      if (vpEstimate != null) {
+        vpX = vpEstimate[0];
+        vpY = vpEstimate[1];
+
+        // Refine scanlines with perspective fit for clean smooth road mesh
+        for (int si = 0; si < scanlineCount; si++) {
+          final double yNorm = roiTopFrac + (roiBottomFrac - roiTopFrac) * (si / scanlineCount);
+          final double progress = (yNorm - vpY).clamp(0.02, 1.0);
+
+          // Perspective beam spreading outward from VP
+          final double fittedLeft = (vpX - (vpX - leftEdgeX[si]) * (progress / (0.88 - vpY))).clamp(0.04, 0.48);
+          final double fittedRight = (vpX + (rightEdgeX[si] - vpX) * (progress / (0.88 - vpY))).clamp(0.52, 0.96);
+
+          if (edgeConfidence[si] > 0.1) {
+            leftEdgeX[si] = 0.7 * leftEdgeX[si] + 0.3 * fittedLeft;
+            rightEdgeX[si] = 0.7 * rightEdgeX[si] + 0.3 * fittedRight;
+          } else {
+            leftEdgeX[si] = fittedLeft;
+            rightEdgeX[si] = fittedRight;
+          }
+          widthPx[si] = (rightEdgeX[si] - leftEdgeX[si]) * width;
+        }
+      }
     }
 
     return SegmentationResult(
@@ -220,70 +261,117 @@ class ClassicalRoadSegmenter implements RoadSegmenter {
     );
   }
 
-  /// Estimate vanishing point as the intersection of the left and right edge regression lines.
-  List<double> _estimateVanishingPoint(
-    Float32List leftX, Float32List rightX, Float32List conf,
-    int count, double roiTopFrac, double roiBottomFrac,
+  /// Resample raw Y-plane into portrait working buffer taking rotation into account.
+  static void _samplePortraitBuffer({
+    required Uint8List src,
+    required int srcW,
+    required int srcH,
+    required Uint8List dst,
+    required int dstW,
+    required int dstH,
+    required int rotationDeg,
+  }) {
+    if (rotationDeg == 90) {
+      // 90 deg clockwise rotation:
+      // Portrait X (0..dstW-1) corresponds to Sensor Y (srcH-1 .. 0)
+      // Portrait Y (0..dstH-1) corresponds to Sensor X (0 .. srcW-1)
+      for (int yp = 0; yp < dstH; yp++) {
+        final int srcX = (yp * (srcW - 1)) ~/ (dstH - 1);
+        final int dstRowOffset = yp * dstW;
+        for (int xp = 0; xp < dstW; xp++) {
+          final int srcY = ((dstW - 1 - xp) * (srcH - 1)) ~/ (dstW - 1);
+          dst[dstRowOffset + xp] = src[srcY * srcW + srcX];
+        }
+      }
+    } else if (rotationDeg == 270) {
+      for (int yp = 0; yp < dstH; yp++) {
+        final int srcX = ((dstH - 1 - yp) * (srcW - 1)) ~/ (dstH - 1);
+        final int dstRowOffset = yp * dstW;
+        for (int xp = 0; xp < dstW; xp++) {
+          final int srcY = (xp * (srcH - 1)) ~/ (dstW - 1);
+          dst[dstRowOffset + xp] = src[srcY * srcW + srcX];
+        }
+      }
+    } else {
+      // 0 deg / direct portrait
+      for (int yp = 0; yp < dstH; yp++) {
+        final int srcY = (yp * (srcH - 1)) ~/ (dstH - 1);
+        final int srcRowOffset = srcY * srcW;
+        final int dstRowOffset = yp * dstW;
+        for (int xp = 0; xp < dstW; xp++) {
+          final int srcX = (xp * (srcW - 1)) ~/ (dstW - 1);
+          dst[dstRowOffset + xp] = src[srcRowOffset + srcX];
+        }
+      }
+    }
+  }
+
+  /// Fit perspective beam regression and find Vanishing Point intersection.
+  List<double>? _fitPerspectiveBeam(
+    List<double> leftX,
+    List<double> leftY,
+    List<double> rightX,
+    List<double> rightY,
   ) {
-    // Weighted linear regression: y_norm = a * x_norm + b
-    // where y_norm is the scanline position (0..1), x_norm is the edge x (0..1)
-    double sumWL = 0, sumWLx = 0, sumWLy = 0, sumWLxy = 0, sumWLx2 = 0;
-    double sumWR = 0, sumWRx = 0, sumWRy = 0, sumWRxy = 0, sumWRx2 = 0;
+    // Fit line: x = m * y + c
+    final lineL = _fitLine(leftY, leftX);
+    final lineR = _fitLine(rightY, rightX);
+    if (lineL == null || lineR == null) return null;
 
-    for (int i = 0; i < count; i++) {
-      final double w = conf[i];
-      if (w < 0.1) continue;
+    final double mL = lineL[0];
+    final double cL = lineL[1];
+    final double mR = lineR[0];
+    final double cR = lineR[1];
 
-      final double yNorm = roiTopFrac + (roiBottomFrac - roiTopFrac) * i / count;
+    final double denom = mL - mR;
+    if (denom.abs() < 1e-5) return null;
 
-      // Left edge
-      sumWL += w;
-      sumWLx += w * leftX[i];
-      sumWLy += w * yNorm;
-      sumWLxy += w * leftX[i] * yNorm;
-      sumWLx2 += w * leftX[i] * leftX[i];
+    // Intersection y where mL * y + cL = mR * y + cR
+    final double vpY = (cR - cL) / (mL - mR);
+    final double vpX = mL * vpY + cL;
 
-      // Right edge
-      sumWR += w;
-      sumWRx += w * rightX[i];
-      sumWRy += w * yNorm;
-      sumWRxy += w * rightX[i] * yNorm;
-      sumWRx2 += w * rightX[i] * rightX[i];
+    if (vpY < 0.05 || vpY > 0.55 || vpX < 0.15 || vpX > 0.85) {
+      return null;
     }
 
-    if (sumWL < 2.0 || sumWR < 2.0) return [0.5, 0.38];
+    return [vpX, vpY];
+  }
 
-    // Left line: y = aL * x + bL
-    final double detL = sumWL * sumWLx2 - sumWLx * sumWLx;
-    if (detL.abs() < 1e-9) return [0.5, 0.38];
-    final double aL = (sumWL * sumWLxy - sumWLx * sumWLy) / detL;
-    final double bL = (sumWLy - aL * sumWLx) / sumWL;
+  /// Linear regression: x = m * y + c
+  List<double>? _fitLine(List<double> yVals, List<double> xVals) {
+    final int n = yVals.length;
+    if (n < 2) return null;
 
-    // Right line: y = aR * x + bR
-    final double detR = sumWR * sumWRx2 - sumWRx * sumWRx;
-    if (detR.abs() < 1e-9) return [0.5, 0.38];
-    final double aR = (sumWR * sumWRxy - sumWRx * sumWRy) / detR;
-    final double bR = (sumWRy - aR * sumWRx) / sumWR;
+    double sumY = 0, sumX = 0, sumYY = 0, sumYX = 0;
+    for (int i = 0; i < n; i++) {
+      final double y = yVals[i];
+      final double x = xVals[i];
+      sumY += y;
+      sumX += x;
+      sumYY += y * y;
+      sumYX += y * x;
+    }
 
-    // Intersection: aL * x + bL = aR * x + bR  =>  x = (bR - bL) / (aL - aR)
-    final double denom = aL - aR;
-    if (denom.abs() < 1e-9) return [0.5, 0.38];
+    final double denom = n * sumYY - sumY * sumY;
+    if (denom.abs() < 1e-8) return null;
 
-    final double vpXEst = (bR - bL) / denom;
-    final double vpYEst = aL * vpXEst + bL;
-
-    // Sanity clamp: VP must be above the ROI and within the image
-    return [
-      vpXEst.clamp(0.2, 0.8),
-      vpYEst.clamp(0.05, roiTopFrac),
-    ];
+    final double m = (n * sumYX - sumY * sumX) / denom;
+    final double c = (sumX - m * sumY) / n;
+    return [m, c];
   }
 
   SegmentationResult _emptyResult(int scanlineCount) {
     final n = math.max(scanlineCount, 1);
+    final left = Float32List(n);
+    final right = Float32List(n);
+    for (int i = 0; i < n; i++) {
+      final double t = i / n;
+      left[i] = (0.50 - (0.15 + 0.25 * t)).clamp(0.05, 0.45);
+      right[i] = (0.50 + (0.15 + 0.25 * t)).clamp(0.55, 0.95);
+    }
     return SegmentationResult(
-      leftEdgeX: Float32List(n),
-      rightEdgeX: Float32List(n),
+      leftEdgeX: left,
+      rightEdgeX: right,
       edgeConfidence: Float32List(n),
       vpX: 0.5,
       vpY: 0.38,

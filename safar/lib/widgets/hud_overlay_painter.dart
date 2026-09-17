@@ -23,6 +23,7 @@ class HudOverlayPainter extends CustomPainter {
   final List<List<double>> dynamicMaskPoly;
   final List<double>? dynamicVP;              // Normalised [x, y]
   final bool useDynamicEdges;
+  final bool isLiveSearching;
 
   // Interactive Tap-to-Measure points
   final Offset? tapPointA;
@@ -41,6 +42,7 @@ class HudOverlayPainter extends CustomPainter {
     this.dynamicMaskPoly = const [],
     this.dynamicVP,
     this.useDynamicEdges = false,
+    this.isLiveSearching = false,
     this.tapPointA,
     this.tapPointB,
     this.tapMeasuredDistanceM,
@@ -80,7 +82,7 @@ class HudOverlayPainter extends CustomPainter {
       if (useDynamicEdges && dynamicMaskPoly.length >= 3) {
         // Dynamic carriageway mask from frame processor
         _drawDynamicCarriagewayMask(canvas, size);
-      } else {
+      } else if (!isLiveSearching) {
         // Static fallback
         _drawStaticCarriagewayMask(canvas, size, vpX, vpY, nearY, farY, farRoadL, farRoadR);
       }
@@ -95,13 +97,17 @@ class HudOverlayPainter extends CustomPainter {
     if (showTransectLadder) {
       if (useDynamicEdges && dynamicLeftEdge.length >= 2 && dynamicRightEdge.length >= 2) {
         _drawDynamicTransectLadder(canvas, size);
-      } else {
+      } else if (!isLiveSearching) {
         _drawStaticTransectLadder(canvas, size, vpX, nearY, farY, farRoadL, farRoadR);
+      } else {
+        _drawSearchingGuide(canvas, size, vpX, vpY);
       }
 
       // Band boundary labels
-      _drawBandLabel(canvas, '15 m FAR LIMIT', Offset(farRoadL - 10, farY - 14));
-      _drawBandLabel(canvas, '5 m NEAR LIMIT', Offset(vpX - size.width * 0.38, nearY + 6));
+      if (!isLiveSearching || useDynamicEdges) {
+        _drawBandLabel(canvas, '15 m FAR LIMIT', Offset(farRoadL - 10, farY - 14));
+        _drawBandLabel(canvas, '5 m NEAR LIMIT', Offset(vpX - size.width * 0.38, nearY + 6));
+      }
     }
 
     // LAYER 3: HUD Readout & Geometry Graphics
@@ -498,6 +504,45 @@ class HudOverlayPainter extends CustomPainter {
     textPainter.paint(canvas, Offset(mid.dx - textPainter.width / 2, mid.dy - textPainter.height / 2));
   }
 
+  void _drawSearchingGuide(Canvas canvas, Size size, double vpX, double vpY) {
+    final Paint guidePaint = Paint()
+      ..color = SafarTokens.hivis.withValues(alpha: 0.50)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.4;
+
+    final double cx = size.width * 0.50;
+    final double cy = size.height * 0.62;
+    final double boxW = size.width * 0.64;
+    final double boxH = size.height * 0.28;
+
+    final double len = 18.0;
+    final double left = cx - boxW / 2;
+    final double right = cx + boxW / 2;
+    final double top = cy - boxH / 2;
+    final double bottom = cy + boxH / 2;
+
+    // Corner alignment brackets
+    canvas.drawLine(Offset(left, top), Offset(left + len, top), guidePaint);
+    canvas.drawLine(Offset(left, top), Offset(left, top + len), guidePaint);
+    canvas.drawLine(Offset(right, top), Offset(right - len, top), guidePaint);
+    canvas.drawLine(Offset(right, top), Offset(right, top + len), guidePaint);
+    canvas.drawLine(Offset(left, bottom), Offset(left + len, bottom), guidePaint);
+    canvas.drawLine(Offset(left, bottom), Offset(left, bottom - len), guidePaint);
+    canvas.drawLine(Offset(right, bottom), Offset(right - len, bottom), guidePaint);
+    canvas.drawLine(Offset(right, bottom), Offset(right, bottom - len), guidePaint);
+
+    // Searching target label
+    final TextPainter tp = TextPainter(
+      text: TextSpan(
+        text: 'ALIGN WITH ROAD CORRIDOR\nSCANNING FOR KERBS & MARKINGS',
+        style: SafarTokens.fontMono(fontSize: 10.0, fontWeight: FontWeight.w700, color: SafarTokens.hivis),
+      ),
+      textAlign: TextAlign.center,
+      textDirection: TextDirection.ltr,
+    )..layout();
+    tp.paint(canvas, Offset(cx - tp.width / 2, cy - tp.height / 2));
+  }
+
   @override
   bool shouldRepaint(covariant HudOverlayPainter oldDelegate) {
     return oldDelegate.showSegmentationTint != showSegmentationTint ||
@@ -506,6 +551,7 @@ class HudOverlayPainter extends CustomPainter {
         oldDelegate.currentWidthM != currentWidthM ||
         oldDelegate.hasOcclusion != hasOcclusion ||
         oldDelegate.useDynamicEdges != useDynamicEdges ||
+        oldDelegate.isLiveSearching != isLiveSearching ||
         oldDelegate.dynamicLeftEdge != dynamicLeftEdge ||
         oldDelegate.dynamicRightEdge != dynamicRightEdge ||
         oldDelegate.dynamicVP != dynamicVP ||

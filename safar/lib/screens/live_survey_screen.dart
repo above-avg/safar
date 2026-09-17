@@ -26,7 +26,10 @@ class _LiveSurveyScreenState extends State<LiveSurveyScreen> {
   bool _isCameraReady = false;
   bool _hasCameraPermission = false;
   bool _useDeviceCamera = true;
-  bool _showInstructions = true;
+  bool _isDemoMode = false;
+  double _simCurve = 0.0;
+  double _simTick = 0.0;
+  bool _showInstructions = false;
 
   bool _isRecording = false;
   bool _layer1SegmentationTint = true;
@@ -240,13 +243,14 @@ class _LiveSurveyScreenState extends State<LiveSurveyScreen> {
         _useDeviceCamera = true;
       });
 
-      // Update focal length from actual camera resolution
+      // Update calibration from actual camera resolution & sensor orientation
       final size = _cameraController!.value.previewSize;
       if (size != null) {
         _frameProcessor?.updateCalibration(
           focalLengthPx: (size.width / 2.0) / math.tan((67.0 * math.pi / 180.0) / 2.0),
           cx: size.width / 2.0,
           cy: size.height / 2.0,
+          sensorOrientation: backCamera.sensorOrientation,
         );
       }
 
@@ -257,6 +261,7 @@ class _LiveSurveyScreenState extends State<LiveSurveyScreen> {
       setState(() {
         _isCameraReady = false;
         _useDeviceCamera = false;
+        _isDemoMode = true;
       });
       _startFallbackSimulation();
     }
@@ -283,30 +288,71 @@ class _LiveSurveyScreenState extends State<LiveSurveyScreen> {
     _isStreamingFrames = false;
   }
 
-  /// Fallback simulation when camera is not available (emulator, permission denied).
-  /// Uses a Timer to generate slowly varying fake data so the UI is not dead.
+  /// Procedural Road Simulation for Demo Mode and Fallback.
+  /// Generates realistic curving road boundaries, dynamic vanishing point,
+  /// and width variations (including IRC:SP:84 fire clearance pinch points).
   void _startFallbackSimulation() {
     _simulationTimer?.cancel();
-    _simulationTimer = Timer.periodic(const Duration(milliseconds: 150), (timer) {
+    _simulationTimer = Timer.periodic(const Duration(milliseconds: 60), (timer) {
       if (!mounted) return;
-      final double t = timer.tick * 0.05;
+      final double t = timer.tick * 0.04;
+      _simTick = timer.tick * 0.05;
+      _simCurve = math.sin(t * 0.6) * 0.06;
+
+      final double simVpX = (0.50 + _simCurve).clamp(0.42, 0.58);
+      final double simVpY = 0.38 + math.cos(t * 0.4) * 0.015;
+
+      // Realistically cycle between wide 2-lane road (7.2m) and narrow pinch point (3.18m)
+      final double widthCycle = math.sin(t * 0.22);
+      final double simulatedWidth = widthCycle < -0.35
+          ? 3.18 + (widthCycle + 0.35).abs() * 0.4
+          : 7.20 + widthCycle * 0.70;
+
+      final List<List<double>> leftPts = [];
+      final List<List<double>> rightPts = [];
+      final List<List<double>> maskPoly = [];
+
+      const int numSteps = 14;
+      for (int i = 0; i <= numSteps; i++) {
+        final double prog = i / numSteps; // 0 = far, 1 = near
+        final double yNorm = 0.38 + 0.52 * prog;
+        final double roadHalfSpan = 0.08 + 0.28 * prog * (simulatedWidth / 7.2);
+        final double curve = math.sin(t * 0.6 + prog * 1.6) * 0.035 * (1.0 - prog);
+
+        final double lx = (simVpX - roadHalfSpan + curve).clamp(0.04, 0.48);
+        final double rx = (simVpX + roadHalfSpan + curve).clamp(0.52, 0.96);
+
+        leftPts.add([lx, yNorm]);
+        rightPts.add([rx, yNorm]);
+      }
+
+      maskPoly.addAll(leftPts);
+      maskPoly.addAll(rightPts.reversed);
+
       setState(() {
         if (!_isTapMeasureActive || _liveTapDistanceM == null) {
-          _currentWidthM = 7.30 + (math.sin(t) * 0.18) + (math.sin(t * 3.0) * 0.04);
-          _halfWidthM = (_currentWidthM > 7.35) ? 0.22 : 0.28;
-          _currentTier = (_halfWidthM <= 0.25) ? 'HIGH' : 'MEDIUM';
-          _calibSource = 'SIMULATOR';
+          _currentWidthM = simulatedWidth;
+          _halfWidthM = (_currentWidthM < 3.5) ? 0.14 : 0.22;
+          _currentTier = (_currentWidthM < 3.5) ? 'LOW' : 'HIGH';
+          _calibSource = 'DEMO SIM';
         }
         _pitchDeg = 5.8 + (math.sin(t * 1.5) * 0.4);
         _imuRms = 0.03 + (math.sin(t * 2.0).abs() * 0.02);
-        _speedKmh = 38.0 + (math.sin(t * 0.8) * 3.5);
-        _gpsHdop = 0.80 + (math.sin(t * 0.4).abs() * 0.10);
+        _speedKmh = 42.0 + (math.sin(t * 0.8) * 3.5);
+        _gpsHdop = 0.80;
         _edgeLeft = 'KERB';
         _edgeRight = 'PAINTED';
-        _observationCount = 28;
-        _madM = 0.11;
+        _observationCount = 32;
+        _madM = (_currentWidthM < 3.5) ? 0.22 : 0.09;
+
+        _leftEdgePoints = leftPts;
+        _rightEdgePoints = rightPts;
+        _carriageMaskPoly = maskPoly;
+        _vanishingPoint = [simVpX, simVpY];
+        _processingFps = 28.5 + (math.sin(t * 3.0) * 1.5);
+
         if (_isRecording) {
-          _chainageM += (_speedKmh * 1000.0 / 3600.0) * 0.15;
+          _chainageM += (_speedKmh * 1000.0 / 3600.0) * 0.06;
         }
       });
     });
@@ -343,12 +389,15 @@ class _LiveSurveyScreenState extends State<LiveSurveyScreen> {
           children: [
             // 1. Camera Viewfinder or Road Perspective Simulation
             Positioned.fill(
-              child: isLive
+              child: isLive && !_isDemoMode
                   ? CameraPreview(_cameraController!)
                   : Container(
                       color: SafarTokens.asphalt900,
                       child: CustomPaint(
-                        painter: _SimulatedRoadBackgroundPainter(),
+                        painter: _SimulatedRoadBackgroundPainter(
+                          roadCurve: _simCurve,
+                          simTick: _simTick,
+                        ),
                       ),
                     ),
             ),
@@ -365,12 +414,13 @@ class _LiveSurveyScreenState extends State<LiveSurveyScreen> {
                     showHudGraphics: _layer3HudGraphics,
                     currentWidthM: _currentWidthM,
                     hasOcclusion: _hasOcclusion,
-                    // Dynamic data from frame processor
+                    // Dynamic data from frame processor or demo simulator
                     dynamicLeftEdge: _leftEdgePoints,
                     dynamicRightEdge: _rightEdgePoints,
                     dynamicMaskPoly: _carriageMaskPoly,
                     dynamicVP: _vanishingPoint,
-                    useDynamicEdges: isLive && _leftEdgePoints.isNotEmpty,
+                    useDynamicEdges: _leftEdgePoints.isNotEmpty,
+                    isLiveSearching: !_isDemoMode && isLive && _leftEdgePoints.isEmpty,
                     tapPointA: _liveTapPointA,
                     tapPointB: _liveTapPointB,
                     tapMeasuredDistanceM: _liveTapDistanceM,
@@ -379,29 +429,87 @@ class _LiveSurveyScreenState extends State<LiveSurveyScreen> {
               ),
             ),
 
-            // 3. Processing FPS indicator (top-left, small)
-            if (isLive && !_isTapMeasureActive)
+            // 3. Top Mode Switcher Banner: CAMERA vs ACTIVE DEMO
+            if (!_isTapMeasureActive)
               Positioned(
                 top: 8,
                 left: 8,
-                child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
-                  decoration: BoxDecoration(
-                    color: SafarTokens.asphalt950.withValues(alpha: 0.80),
-                    borderRadius: BorderRadius.circular(SafarTokens.rSm),
-                  ),
-                  child: Text(
-                    '${_processingFps.toStringAsFixed(1)} FPS | ${_isStreamingFrames ? "LIVE" : "PAUSED"}',
-                    style: SafarTokens.fontMono(
-                      fontSize: 10.0,
-                      fontWeight: FontWeight.w600,
-                      color: _processingFps > 5
-                          ? SafarTokens.confHigh
-                          : _processingFps > 2
-                              ? SafarTokens.confMed
-                              : SafarTokens.confLow,
+                right: 8,
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Container(
+                      height: 34,
+                      padding: const EdgeInsets.all(2),
+                      decoration: BoxDecoration(
+                        color: SafarTokens.asphalt950.withValues(alpha: 0.95),
+                        borderRadius: BorderRadius.circular(SafarTokens.rSm),
+                        border: Border.all(color: SafarTokens.asphalt700),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          _buildViewModePill(
+                            title: 'CAMERA',
+                            icon: Icons.videocam,
+                            isActive: !_isDemoMode,
+                            onTap: () {
+                              if (_isDemoMode) {
+                                setState(() {
+                                  _isDemoMode = false;
+                                  _useDeviceCamera = true;
+                                });
+                                _simulationTimer?.cancel();
+                                if (_hasCameraPermission) {
+                                  _startImageStream();
+                                } else {
+                                  _requestPermissions();
+                                }
+                              }
+                            },
+                          ),
+                          _buildViewModePill(
+                            title: 'DEMO MODE',
+                            icon: Icons.science,
+                            isActive: _isDemoMode,
+                            onTap: () {
+                              if (!_isDemoMode) {
+                                setState(() {
+                                  _isDemoMode = true;
+                                  _useDeviceCamera = false;
+                                });
+                                _stopImageStream();
+                                _startFallbackSimulation();
+                              }
+                            },
+                          ),
+                        ],
+                      ),
                     ),
-                  ),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                      decoration: BoxDecoration(
+                        color: SafarTokens.asphalt950.withValues(alpha: 0.92),
+                        borderRadius: BorderRadius.circular(SafarTokens.rSm),
+                        border: Border.all(
+                          color: _isDemoMode ? SafarTokens.paint : SafarTokens.hivis,
+                          width: 1.0,
+                        ),
+                      ),
+                      child: Text(
+                        _isDemoMode
+                            ? 'DEMO ROAD | ${_currentWidthM < 3.5 ? "PINCH ALERT!" : "OK"}'
+                            : '${_processingFps.toStringAsFixed(1)} FPS | ${isLive ? (_leftEdgePoints.isEmpty ? "SCANNING" : "TRACKING") : "NO CAM"}',
+                        style: SafarTokens.fontMono(
+                          fontSize: 10.5,
+                          fontWeight: FontWeight.w800,
+                          color: _isDemoMode
+                              ? (_currentWidthM < 3.5 ? SafarTokens.confLow : SafarTokens.paint)
+                              : (_leftEdgePoints.isNotEmpty ? SafarTokens.confHigh : SafarTokens.hivis),
+                        ),
+                      ),
+                    ),
+                  ],
                 ),
               ),
 
@@ -466,40 +574,10 @@ class _LiveSurveyScreenState extends State<LiveSurveyScreen> {
                 ),
               ),
 
-            // 5. "SIMULATOR MODE" banner when using fallback
-            if (!isLive && !_isTapMeasureActive)
+            // 5. Camera Edge Searching Hint (if camera live but no edges found yet)
+            if (isLive && !_isDemoMode && _leftEdgePoints.isEmpty && !_isTapMeasureActive)
               Positioned(
-                top: 8,
-                left: 8,
-                child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                  decoration: BoxDecoration(
-                    color: SafarTokens.asphalt950.withValues(alpha: 0.90),
-                    borderRadius: BorderRadius.circular(SafarTokens.rSm),
-                    border: Border.all(color: SafarTokens.hivisDim),
-                  ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      const Icon(Icons.science_outlined, size: 14, color: SafarTokens.hivis),
-                      const SizedBox(width: 6),
-                      Text(
-                        'SIMULATOR (SYNTHETIC ROAD)',
-                        style: SafarTokens.fontMono(
-                          fontSize: 10.0,
-                          fontWeight: FontWeight.w800,
-                          color: SafarTokens.paint,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-
-            // 6. Camera Edge Searching Hint (if camera live but no edges found yet)
-            if (isLive && _leftEdgePoints.isEmpty && !_isTapMeasureActive)
-              Positioned(
-                top: 36,
+                top: 48,
                 left: 8,
                 right: 74,
                 child: Container(
@@ -879,40 +957,105 @@ class _LiveSurveyScreenState extends State<LiveSurveyScreen> {
       ),
     );
   }
+
+  Widget _buildViewModePill({
+    required String title,
+    required IconData icon,
+    required bool isActive,
+    required VoidCallback onTap,
+  }) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+        decoration: BoxDecoration(
+          color: isActive ? SafarTokens.hivis : Colors.transparent,
+          borderRadius: BorderRadius.circular(SafarTokens.rSm - 2),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              icon,
+              size: 14,
+              color: isActive ? SafarTokens.asphalt950 : SafarTokens.asphalt400,
+            ),
+            const SizedBox(width: 5),
+            Text(
+              title,
+              style: SafarTokens.fontMono(
+                fontSize: 10.5,
+                fontWeight: FontWeight.w800,
+                color: isActive ? SafarTokens.asphalt950 : SafarTokens.concrete100,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 }
 
-// Background painter creating a perspective road simulation
+// Background painter creating an animated perspective road simulation
 class _SimulatedRoadBackgroundPainter extends CustomPainter {
+  final double roadCurve;
+  final double simTick;
+
+  _SimulatedRoadBackgroundPainter({this.roadCurve = 0.0, this.simTick = 0.0});
+
   @override
   void paint(Canvas canvas, Size size) {
-    final double vpX = size.width * 0.50;
+    final double vpX = size.width * (0.50 + roadCurve);
     final double vpY = size.height * 0.38;
 
     // Sky
     final Paint skyPaint = Paint()..color = SafarTokens.asphalt800;
     canvas.drawRect(Rect.fromLTRB(0, 0, size.width, vpY), skyPaint);
 
-    // Ground / Asphalt Road
-    final Path groundPath = Path()
-      ..moveTo(0, vpY)
-      ..lineTo(size.width, vpY)
-      ..lineTo(size.width, size.height)
-      ..lineTo(0, size.height)
-      ..close();
+    // Ground
     final Paint groundPaint = Paint()..color = SafarTokens.asphalt900;
-    canvas.drawPath(groundPath, groundPaint);
+    canvas.drawRect(Rect.fromLTRB(0, vpY, size.width, size.height), groundPaint);
 
     // Road surface perspective wedge
     final Path roadPath = Path()
-      ..moveTo(vpX - 40, vpY)
-      ..lineTo(vpX + 40, vpY)
-      ..lineTo(size.width * 0.95, size.height)
-      ..lineTo(size.width * 0.05, size.height)
+      ..moveTo(vpX - 45, vpY)
+      ..lineTo(vpX + 45, vpY)
+      ..lineTo(size.width * 0.96, size.height)
+      ..lineTo(size.width * 0.04, size.height)
       ..close();
     final Paint roadPaint = Paint()..color = SafarTokens.asphalt950;
     canvas.drawPath(roadPath, roadPaint);
+
+    // Road Kerbs
+    final Paint curbPaint = Paint()
+      ..color = SafarTokens.asphalt700
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 3.0;
+    canvas.drawLine(Offset(vpX - 45, vpY), Offset(size.width * 0.04, size.height), curbPaint);
+    canvas.drawLine(Offset(vpX + 45, vpY), Offset(size.width * 0.96, size.height), curbPaint);
+
+    // Moving dashed center lane line (perspectively accelerated)
+    final Paint dashPaint = Paint()
+      ..color = SafarTokens.segMarking
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2.5;
+
+    final double speedOffset = (simTick * 0.6) % 1.0;
+    for (int k = 0; k < 6; k++) {
+      final double t1 = ((k + speedOffset) / 6.0).clamp(0.04, 0.96);
+      final double t2 = ((k + speedOffset + 0.45) / 6.0).clamp(0.04, 0.96);
+
+      final double y1 = vpY + (size.height - vpY) * (t1 * t1);
+      final double y2 = vpY + (size.height - vpY) * (t2 * t2);
+
+      final double x1 = vpX + (size.width * 0.50 - vpX) * t1;
+      final double x2 = vpX + (size.width * 0.50 - vpX) * t2;
+
+      canvas.drawLine(Offset(x1, y1), Offset(x2, y2), dashPaint);
+    }
   }
 
   @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+  bool shouldRepaint(covariant _SimulatedRoadBackgroundPainter oldDelegate) =>
+      oldDelegate.roadCurve != roadCurve || oldDelegate.simTick != simTick;
 }
